@@ -28,7 +28,7 @@ function get_list_of_veth_from_bridge() {
 
 HOST_PREFIX=${HOST_PREFIX:-/host}
 if [[ -z "${CILIUM_FLANNEL_MASTER_DEVICE}" ]]; then
-    CNI_CONF_NAME=${CNI_CONF_NAME:-05-cilium.conf}
+    CNI_CONF_NAME=${CNI_CONF_NAME:-05-cilium.conflist}
 else
     CNI_CONF_NAME=${CNI_CONF_NAME:-04-flannel-cilium-cni.conflist}
 fi

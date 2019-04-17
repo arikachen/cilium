@@ -300,6 +300,139 @@ func prepareIP(ipAddr string, isIPv6 bool, state *CmdState, mtu int) (*cniTypesV
 	}, rt, nil
 }
 
+func setupAWS(logger *logrus.Entry, args *skel.CmdArgs, cniArgs cniArgsSpec, n *netConf, cniVer string, c *client.Client) (res *cniTypesVer.Result, err error) {
+	err = cniVersion.ParsePrevResult(&n.NetConf)
+	if err != nil {
+		err = fmt.Errorf("unable to understand network config: %s", err)
+		return
+	}
+
+	var prevRes *cniTypesVer.Result
+	prevRes, err = cniTypesVer.NewResultFromResult(n.PrevResult)
+	if err != nil {
+		err = fmt.Errorf("unable to get previous network result: %s", err)
+		return
+	}
+
+	defer func() {
+		if err != nil {
+			logger.WithError(err).
+				WithFields(logrus.Fields{"cni-pre-result": n.PrevResult.String()}).
+				Errorf("Unable to create endpoint")
+		}
+	}()
+	var (
+		hostMac, vethHostName, vethLXCMac, vethIP string
+		vethHostIdx                               int
+	)
+
+	if len(prevRes.IPs) != 1 {
+		err = fmt.Errorf("more than 1 IP provided in result from aws-cni")
+		return
+	}
+
+	var routes []netlink.Route
+	routes, err = netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		err = fmt.Errorf("unable to list routes: %s", err)
+		return
+	}
+
+	for _, r := range routes {
+		if r.Dst == nil {
+			continue
+		}
+
+		aMaskLen, aMaskBits := r.Dst.Mask.Size()
+		bMaskLen, bMaskBits := prevRes.IPs[0].Address.Mask.Size()
+		if aMaskLen != bMaskLen || aMaskBits != bMaskBits || !r.Dst.IP.Equal(prevRes.IPs[0].Address.IP) {
+			log.Debugf("Ignoring route %+v", r)
+			continue
+		}
+
+		var link netlink.Link
+		link, err = netlink.LinkByIndex(r.LinkIndex)
+		if err != nil {
+			err = fmt.Errorf("unable to lookup link with ifindex %d: %s", r.LinkIndex, err)
+			return
+		}
+
+		vethHostName = link.Attrs().Name
+		vethHostIdx = link.Attrs().Index
+		vethIP = r.Dst.IP.String()
+		hostMac = link.Attrs().HardwareAddr.String()
+
+		veth, ok := link.(*netlink.Veth)
+		if !ok {
+			err = fmt.Errorf("link %s is not a veth interface", vethHostName)
+			return
+		}
+
+		var peerIndex int
+		peerIndex, err = netlink.VethPeerIndex(veth)
+		if err != nil {
+			err = fmt.Errorf("unable to retrieve index of veth peer %s: %s", vethHostName, err)
+			return
+		}
+
+		var peer netlink.Link
+		peer, err = netlink.LinkByIndex(peerIndex)
+		if err != nil {
+			err = fmt.Errorf("unable to lookup link %s: %s", veth.PeerName, err)
+			return
+		}
+
+		vethLXCMac = peer.Attrs().HardwareAddr.String()
+	}
+
+	switch {
+	case vethHostName == "":
+		err = errors.New("unable to determine name of veth pair on the host side")
+		return
+	case vethLXCMac == "":
+		err = errors.New("unable to determine MAC address of veth pair on the container side")
+		return
+	case vethIP == "":
+		err = errors.New("unable to determine IP address of the container")
+		return
+	case vethHostIdx == 0:
+		err = errors.New("unable to determine index interface of veth pair on the host side")
+		return
+	}
+
+	ep := &models.EndpointChangeRequest{
+		Addressing: &models.AddressPair{
+			IPV4: vethIP,
+		},
+		ContainerID:       args.ContainerID,
+		State:             models.EndpointStateWaitingForIdentity,
+		HostMac:           hostMac,
+		InterfaceIndex:    int64(vethHostIdx),
+		Mac:               vethLXCMac,
+		InterfaceName:     vethHostName,
+		K8sPodName:        string(cniArgs.K8S_POD_NAME),
+		K8sNamespace:      string(cniArgs.K8S_POD_NAMESPACE),
+		SyncBuildEndpoint: true,
+	}
+
+	err = c.EndpointCreate(ep)
+	if err != nil {
+		logger.WithError(err).WithFields(logrus.Fields{
+			logfields.ContainerID: ep.ContainerID}).Warn("Unable to create endpoint")
+		err = fmt.Errorf("unable to create endpoint: %s", err)
+		return
+	}
+
+	logger.WithFields(logrus.Fields{
+		logfields.ContainerID: ep.ContainerID}).Debug("Endpoint successfully created")
+
+	res = &cniTypesVer.Result{
+		IPs: prevRes.IPs,
+	}
+
+	return
+}
+
 func setUPWithFlannel(logger *logrus.Entry, args *skel.CmdArgs, cniArgs cniArgsSpec, n *netConf, cniVer string, c *client.Client) (err error) {
 	err = cniVersion.ParsePrevResult(&n.NetConf)
 	if err != nil {
@@ -439,6 +572,13 @@ func cmdAdd(args *skel.CmdArgs) (err error) {
 
 	if len(n.NetConf.RawPrevResult) != 0 {
 		switch n.Name {
+		case "aws-cni":
+			var res *cniTypesVer.Result
+			res, err = setupAWS(logger, args, cniArgs, n, cniVer, c)
+			if err != nil {
+				return
+			}
+			return cniTypes.PrintResult(res, cniVer)
 		case "cbr0":
 			err = setUPWithFlannel(logger, args, cniArgs, n, cniVer, c)
 			if err != nil {

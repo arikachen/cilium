@@ -4,7 +4,7 @@ set -e
 
 HOST_PREFIX=${HOST_PREFIX:-/host}
 if [ -z "${CILIUM_FLANNEL_MASTER_DEVICE}" ]; then
-	CNI_CONF_NAME=${CNI_CONF_NAME:-05-cilium.conf}
+	CNI_CONF_NAME=${CNI_CONF_NAME:-05-cilium.conflist}
 else
 	until ip link show "${CILIUM_FLANNEL_MASTER_DEVICE}" &>/dev/null ; do
 		echo "Waiting for ${CILIUM_FLANNEL_MASTER_DEVICE} to be initialized"
@@ -48,8 +48,23 @@ else
 	if [ -z "${CILIUM_FLANNEL_MASTER_DEVICE}" ]; then
 		cat > ${CNI_CONF_NAME} <<EOF
 {
-    "name": "cilium",
-    "type": "cilium-cni"
+  "name": "aws-cni",
+  "plugins": [
+    {
+      "name": "aws-cni",
+      "type": "aws-cni",
+      "vethPrefix": "eni"
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true},
+      "snat": true
+    },
+    {
+       "name": "cilium",
+       "type": "cilium-cni"
+    }
+  ]
 }
 EOF
 	else
